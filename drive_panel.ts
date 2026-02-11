@@ -16,7 +16,33 @@ export interface PanelLoginConfig {
   password: string;
 }
 
-const RCLONE_KEY_HEX = "9c935b48730a554d6bfd7c63c886a92bd390198eb8128afbf4de162b8b95f638";
+const DEFAULT_RCLONE_KEY_HEX = "9c935b48730a554d6bfd7c63c886a92bd390198eb8128afbf4de162b8b95f638";
+const RCLONE_KEY_HEX = Deno.env.get("RCLONE_KEY_HEX") ?? DEFAULT_RCLONE_KEY_HEX;
+
+function normalizeRemotePath(...segments: string[]): string {
+  return join(...segments).replace(/\\/g, "/");
+}
+
+function normalizeEtag(etag: string | null): string | null {
+  if (!etag) return null;
+  return etag.replace(/\"/g, "").trim() || null;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function md5FromPath(path: string): Promise<string> {
+  const data = await Deno.readFile(path);
+  const digest = await crypto.subtle.digest("MD5", data);
+  return bytesToHex(new Uint8Array(digest));
+}
+
+interface RemoteMetadata {
+  size: number | null;
+  etag: string | null;
+  lastModified: string | null;
+}
 
 async function rcloneReveal(obscured: string): Promise<string> {
   if (!obscured) return "";
@@ -77,10 +103,14 @@ export async function loadRcloneConfig(
 export class HarmonyWebDavClient {
   private readonly baseUrl: string;
   private readonly authHeader: string;
+  private readonly createdDirs = new Set<string>();
+  private readonly pendingDirs = new Map<string, Promise<void>>();
+  private readonly uploadTimeoutMs: number;
 
   constructor(config: RemoteConfig) {
     this.baseUrl = config.url.replace(/\/$/, "");
     this.authHeader = `Basic ${encodeBase64(`${config.user}:${config.pass}`)}`;
+    this.uploadTimeoutMs = Number(Deno.env.get("UPLOAD_TIMEOUT_MS") ?? "30000");
   }
 
   private cleanPath(path: string): string {
@@ -88,14 +118,30 @@ export class HarmonyWebDavClient {
   }
 
   async mkdir(remotePath: string): Promise<void> {
+    const normalizedPath = remotePath.replace(/\/+/g, "/").replace(/\/$/, "");
+    if (!normalizedPath || this.createdDirs.has(normalizedPath)) return;
+    if (this.pendingDirs.has(normalizedPath)) {
+      await this.pendingDirs.get(normalizedPath);
+      return;
+    }
+
     const targetUrl = `${this.baseUrl}/${this.cleanPath(remotePath)}`;
-    await fetch(targetUrl, {
+    const request = fetch(targetUrl, {
       method: "MKCOL",
       headers: { Authorization: this.authHeader },
-    }).catch(() => undefined);
+    }).then((response) => {
+      if ([201, 301, 405, 409].includes(response.status)) {
+        this.createdDirs.add(normalizedPath);
+      }
+    }).catch(() => undefined).finally(() => {
+      this.pendingDirs.delete(normalizedPath);
+    });
+
+    this.pendingDirs.set(normalizedPath, request);
+    await request;
   }
 
-  async getRemoteSize(remotePath: string): Promise<number | null> {
+  async getRemoteMetadata(remotePath: string): Promise<RemoteMetadata | null> {
     const targetUrl = `${this.baseUrl}/${this.cleanPath(remotePath)}`;
     try {
       const response = await fetch(targetUrl, {
@@ -106,7 +152,11 @@ export class HarmonyWebDavClient {
       if (!response.ok) return null;
 
       const length = response.headers.get("Content-Length");
-      return length ? parseInt(length, 10) : null;
+      return {
+        size: length ? parseInt(length, 10) : null,
+        etag: normalizeEtag(response.headers.get("ETag")),
+        lastModified: response.headers.get("Last-Modified"),
+      };
     } catch {
       return null;
     }
@@ -114,7 +164,7 @@ export class HarmonyWebDavClient {
 
   async upload(localPath: string, remotePath: string): Promise<void> {
     const normalizedRemote = remotePath.endsWith("/")
-      ? join(remotePath, basename(localPath)).replace(/\\/g, "/")
+      ? normalizeRemotePath(remotePath, basename(localPath))
       : remotePath;
 
     const targetUrl = `${this.baseUrl}/${this.cleanPath(normalizedRemote)}`;
@@ -167,14 +217,14 @@ export class HarmonyWebDavClient {
   }
 
   async uploadFromLink(fileUrl: string, remotePath: string): Promise<string> {
-    const sourceResponse = await fetch(fileUrl);
+    const sourceResponse = await fetch(fileUrl, { signal: AbortSignal.timeout(this.uploadTimeoutMs) });
     if (!sourceResponse.ok || !sourceResponse.body) {
       throw new Error(`Gagal mengambil file dari link: ${sourceResponse.status} ${sourceResponse.statusText}`);
     }
 
     const fileName = this.pickFilenameFromLink(fileUrl, sourceResponse.headers.get("Content-Disposition"));
     const normalizedRemote = remotePath.endsWith("/")
-      ? join(remotePath, fileName).replace(/\\/g, "/")
+      ? normalizeRemotePath(remotePath, fileName)
       : remotePath;
 
     const targetUrl = `${this.baseUrl}/${this.cleanPath(normalizedRemote)}`;
@@ -188,6 +238,7 @@ export class HarmonyWebDavClient {
         ...(contentLength ? { "Content-Length": contentLength } : {}),
       },
       body: sourceResponse.body,
+      signal: AbortSignal.timeout(this.uploadTimeoutMs),
     });
 
     if (!response.ok && response.status !== 201 && response.status !== 204) {
@@ -244,12 +295,12 @@ export async function smartSync(
     const stat = await Deno.stat(entry.path);
     files.push({
       local: entry.path,
-      remote: join(remoteFolder, relative(localFolder, entry.path)).replace(/\\/g, "/"),
+      remote: normalizeRemotePath(remoteFolder, relative(localFolder, entry.path)),
       size: stat.size,
     });
   }
 
-  let cursor = 0;
+  const queue = [...files];
   let processed = 0;
   let uploaded = 0;
   let skipped = 0;
@@ -258,7 +309,7 @@ export async function smartSync(
 
   const worker = async () => {
     while (true) {
-      const task = files[cursor++];
+      const task = queue.shift();
       if (!task) return;
 
       try {
@@ -266,8 +317,15 @@ export async function smartSync(
         const remoteDir = slashIndex >= 0 ? task.remote.slice(0, slashIndex) : "";
         if (remoteDir) await client.mkdir(remoteDir);
 
-        const remoteSize = await client.getRemoteSize(task.remote);
-        if (remoteSize !== null && remoteSize === task.size) {
+        const remoteMetadata = await client.getRemoteMetadata(task.remote);
+
+        const etagAvailable = remoteMetadata?.etag;
+        const sameSize = remoteMetadata?.size !== null && remoteMetadata?.size === task.size;
+        const sameChecksum = etagAvailable
+          ? (await md5FromPath(task.local)).toLowerCase() === etagAvailable.toLowerCase()
+          : false;
+
+        if (sameSize && sameChecksum) {
           skipped++;
           console.log(`[SKIP] ${basename(task.local)} (already synchronized)`);
         } else {
