@@ -140,6 +140,63 @@ export class HarmonyWebDavClient {
     }
   }
 
+  private pickFilenameFromLink(fileUrl: string, contentDisposition: string | null): string {
+    if (contentDisposition) {
+      const utf8Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+      if (utf8Match?.[1]) {
+        try {
+          return decodeURIComponent(utf8Match[1]).trim();
+        } catch {
+          return utf8Match[1].trim();
+        }
+      }
+
+      const filenameMatch = contentDisposition.match(/filename="?([^";]+)"?/i);
+      if (filenameMatch?.[1]) return filenameMatch[1].trim();
+    }
+
+    try {
+      const pathname = new URL(fileUrl).pathname;
+      const name = basename(decodeURIComponent(pathname));
+      if (name && name !== "/" && name !== ".") return name;
+    } catch {
+      // fallback handled below
+    }
+
+    return `download-${Date.now()}.bin`;
+  }
+
+  async uploadFromLink(fileUrl: string, remotePath: string): Promise<string> {
+    const sourceResponse = await fetch(fileUrl);
+    if (!sourceResponse.ok || !sourceResponse.body) {
+      throw new Error(`Gagal mengambil file dari link: ${sourceResponse.status} ${sourceResponse.statusText}`);
+    }
+
+    const fileName = this.pickFilenameFromLink(fileUrl, sourceResponse.headers.get("Content-Disposition"));
+    const normalizedRemote = remotePath.endsWith("/")
+      ? join(remotePath, fileName).replace(/\\/g, "/")
+      : remotePath;
+
+    const targetUrl = `${this.baseUrl}/${this.cleanPath(normalizedRemote)}`;
+    const contentType = sourceResponse.headers.get("Content-Type") ?? "application/octet-stream";
+    const contentLength = sourceResponse.headers.get("Content-Length");
+    const response = await fetch(targetUrl, {
+      method: "PUT",
+      headers: {
+        Authorization: this.authHeader,
+        "Content-Type": contentType,
+        ...(contentLength ? { "Content-Length": contentLength } : {}),
+      },
+      body: sourceResponse.body,
+    });
+
+    if (!response.ok && response.status !== 201 && response.status !== 204) {
+      throw new Error(`Upload dari link gagal: ${response.status} ${response.statusText}`);
+    }
+
+    return normalizedRemote;
+  }
+
   async download(remotePath: string, localPath: string): Promise<void> {
     const targetUrl = `${this.baseUrl}/${this.cleanPath(remotePath)}`;
     const response = await fetch(targetUrl, {
@@ -283,7 +340,8 @@ export class DrivePowerPanel {
       console.log("1) Upload file");
       console.log("2) Download file");
       console.log("3) Smart sync folder (parallel + resume)");
-      console.log("4) Exit");
+      console.log("4) Upload file dari link (URL)");
+      console.log("5) Exit");
 
       const selected = this.ask("Pilih menu");
       if (selected === "1") {
@@ -309,6 +367,21 @@ export class DrivePowerPanel {
         console.log(`Failed   : ${report.failed}`);
         console.log(`Durasi   : ${(report.elapsedMs / 1000).toFixed(2)} detik\n`);
       } else if (selected === "4") {
+        const fileUrl = this.ask("Link file (URL)");
+        const remotePath = this.ask("Path remote tujuan (boleh folder dengan akhiran /)");
+
+        const slashIndex = remotePath.lastIndexOf("/");
+        const remoteDir = remotePath.endsWith("/")
+          ? remotePath.slice(0, -1)
+          : slashIndex >= 0
+          ? remotePath.slice(0, slashIndex)
+          : "";
+
+        if (remoteDir) await this.client.mkdir(remoteDir);
+
+        const uploadedPath = await this.client.uploadFromLink(fileUrl, remotePath);
+        console.log(`✅ Upload dari link selesai: ${uploadedPath}\n`);
+      } else if (selected === "5") {
         console.log("👋 Sampai jumpa.");
         return;
       } else {
