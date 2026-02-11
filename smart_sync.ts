@@ -16,10 +16,10 @@ if (import.meta.main) {
 
   const config = await loadRcloneConfig(configPath, remoteName);
   if (!config) {
-    console.error(`❌ Remote [${remoteName}] tidak ditemukan dari ${configPath}`);
+    console.error(`❌ Remote [${remoteName}] was not found in ${configPath}`);
     Deno.exit(1);
   }
 
   const report = await smartSync(new WebDavClient(config), localDir, remoteDir, concurrency);
-  console.log("🏁 Sinkronisasi selesai:", report);
+  console.log("🏁 Synchronization completed:", report);
 }

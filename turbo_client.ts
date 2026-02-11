@@ -54,10 +54,10 @@ if (import.meta.main) {
 
   const config = await loadRcloneConfig(configPath, remoteName);
   if (!config) {
-    console.error(`❌ Remote [${remoteName}] tidak ditemukan`);
+    console.error(`❌ Remote [${remoteName}] was not found`);
     Deno.exit(1);
   }
 
-  console.log("🚀 Turbo mode harmonized aktif...");
+  console.log("🚀 Harmonized turbo mode is active...");
   await uploadFolderParallel(new WebDavClient(config), localDir, remoteDir, concurrency);
 }

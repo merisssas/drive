@@ -1,7 +1,7 @@
 import { decodeBase64, encodeBase64 } from "jsr:@std/encoding/base64";
 import { walk } from "jsr:@std/fs";
 import { parse } from "jsr:@std/ini";
-import { basename, join, relative } from "jsr:@std/path";
+import { basename, dirname, join, relative } from "jsr:@std/path";
 import { crypto } from "jsr:@std/crypto";
 
 export interface RemoteConfig {
@@ -141,7 +141,7 @@ export class HarmonyWebDavClient {
       }
     }
 
-    throw lastError instanceof Error ? lastError : new Error("Operasi gagal setelah retry");
+    throw lastError instanceof Error ? lastError : new Error("Operation failed after retries");
   }
 
   async mkdir(remotePath: string): Promise<void> {
@@ -179,7 +179,7 @@ export class HarmonyWebDavClient {
       if (response.status === 404) return null;
       if (!response.ok) {
         if (this.isRetryableStatus(response.status)) {
-          throw new Error(`HEAD gagal: ${response.status} ${response.statusText}`);
+          throw new Error(`HEAD failed: ${response.status} ${response.statusText}`);
         }
         return null;
       }
@@ -219,7 +219,7 @@ export class HarmonyWebDavClient {
           if (this.isRetryableStatus(response.status)) {
             throw new Error(`Upload retryable: ${response.status} ${response.statusText}`);
           }
-          throw new Error(`Upload gagal: ${response.status} ${response.statusText}`);
+          throw new Error(`Upload failed: ${response.status} ${response.statusText}`);
         }
       } finally {
         file.close();
@@ -258,9 +258,9 @@ export class HarmonyWebDavClient {
       const sourceResponse = await fetch(fileUrl, { signal: AbortSignal.timeout(this.uploadTimeoutMs) });
       if (!sourceResponse.ok || !sourceResponse.body) {
         if (this.isRetryableStatus(sourceResponse.status)) {
-          throw new Error(`Ambil link retryable: ${sourceResponse.status} ${sourceResponse.statusText}`);
+          throw new Error(`Fetch URL retryable: ${sourceResponse.status} ${sourceResponse.statusText}`);
         }
-        throw new Error(`Gagal mengambil file dari link: ${sourceResponse.status} ${sourceResponse.statusText}`);
+        throw new Error(`Failed to fetch file from URL: ${sourceResponse.status} ${sourceResponse.statusText}`);
       }
 
       const fileName = this.pickFilenameFromLink(fileUrl, sourceResponse.headers.get("Content-Disposition"));
@@ -286,7 +286,7 @@ export class HarmonyWebDavClient {
         if (this.isRetryableStatus(response.status)) {
           throw new Error(`Upload link retryable: ${response.status} ${response.statusText}`);
         }
-        throw new Error(`Upload dari link gagal: ${response.status} ${response.statusText}`);
+        throw new Error(`Upload from URL failed: ${response.status} ${response.statusText}`);
       }
 
       return normalizedRemote;
@@ -306,7 +306,7 @@ export class HarmonyWebDavClient {
         if (this.isRetryableStatus(response.status)) {
           throw new Error(`Download retryable: ${response.status} ${response.statusText}`);
         }
-        throw new Error(`Download gagal: ${response.status} ${response.statusText}`);
+        throw new Error(`Download failed: ${response.status} ${response.statusText}`);
       }
 
       const file = await Deno.open(localPath, { write: true, create: true, truncate: true });
@@ -413,11 +413,15 @@ export async function smartSync(
 }
 
 export class DrivePowerPanel {
-  private readonly loginConfig: PanelLoginConfig;
+  private loginConfig: PanelLoginConfig;
   private readonly client: HarmonyWebDavClient;
+  private readonly credentialsPath: string;
 
   constructor(client: HarmonyWebDavClient, loginConfig?: Partial<PanelLoginConfig>) {
     this.client = client;
+    const home = Deno.env.get("HOME") || Deno.env.get("USERPROFILE") || ".";
+    this.credentialsPath = Deno.env.get("PANEL_CREDENTIALS_FILE") ??
+      join(home, ".config", "harmony-drive", "panel_admin.json");
     this.loginConfig = {
       username: loginConfig?.username ?? Deno.env.get("PANEL_USER") ?? "admin",
       password: loginConfig?.password ?? Deno.env.get("PANEL_PASS") ?? "admin123",
@@ -433,9 +437,61 @@ export class DrivePowerPanel {
   }
 
   private renderHero(): void {
-    console.log("\n⚡ Harmony Drive Panel ⚡");
-    console.log("Satu script terpadu: login, upload, download, smart sync, dan telemetry.");
-    console.log("Dirancang untuk workflow cepat, hemat bandwidth, dan otomatis skip file sama.\n");
+    console.log("\n╔══════════════════════════════════════════════╗");
+    console.log("║            ⚡ Harmony Drive Panel ⚡          ║");
+    console.log("╚══════════════════════════════════════════════╝");
+    console.log("All-in-one CLI panel for login, upload, download, smart sync, and telemetry.");
+    console.log("Built for fast workflows, bandwidth efficiency, and automatic duplicate skipping.\n");
+  }
+
+  private async setupAdminCredentials(): Promise<void> {
+    console.log("🛠️  First-time setup detected.");
+    console.log("Please create the admin account used to sign in to this panel.\n");
+
+    while (true) {
+      const username = this.ask("Create admin username");
+      const password = this.askMasked("Create admin password");
+      const confirmation = this.askMasked("Confirm admin password");
+
+      if (!username || !password) {
+        console.log("⚠️  Username and password cannot be empty. Please try again.\n");
+        continue;
+      }
+
+      if (password !== confirmation) {
+        console.log("⚠️  Password confirmation does not match. Please try again.\n");
+        continue;
+      }
+
+      const payload: PanelLoginConfig = { username, password };
+      await Deno.mkdir(dirname(this.credentialsPath), { recursive: true });
+      await Deno.writeTextFile(this.credentialsPath, JSON.stringify(payload, null, 2));
+      this.loginConfig = payload;
+      console.log(`✅ Admin account saved to ${this.credentialsPath}.\n`);
+      return;
+    }
+  }
+
+  private async loadLoginConfig(): Promise<void> {
+    const envUser = Deno.env.get("PANEL_USER");
+    const envPass = Deno.env.get("PANEL_PASS");
+    if (envUser && envPass) {
+      this.loginConfig = { username: envUser, password: envPass };
+      return;
+    }
+
+    try {
+      const raw = await Deno.readTextFile(this.credentialsPath);
+      const parsed = JSON.parse(raw) as Partial<PanelLoginConfig>;
+      if (parsed.username && parsed.password) {
+        this.loginConfig = { username: parsed.username, password: parsed.password };
+        return;
+      }
+    } catch {
+      // run first-time setup below
+    }
+
+    await this.setupAdminCredentials();
   }
 
   async login(): Promise<boolean> {
@@ -444,52 +500,53 @@ export class DrivePowerPanel {
     const password = this.askMasked("Password");
 
     if (username !== this.loginConfig.username || password !== this.loginConfig.password) {
-      console.error("❌ Login gagal. Cek PANEL_USER/PANEL_PASS atau kredensial default.");
+      console.error("❌ Login failed. Check PANEL_USER/PANEL_PASS or your saved admin credentials.");
       return false;
     }
 
-    console.log("✅ Login berhasil. Selamat datang di panel power!\n");
+    console.log("✅ Login successful. Welcome to the power panel!\n");
     return true;
   }
 
   async start(): Promise<void> {
+    await this.loadLoginConfig();
     const ok = await this.login();
     if (!ok) return;
 
     while (true) {
-      console.log("=== MENU PANEL ===");
+      console.log("=== PANEL MENU ===");
       console.log("1) Upload file");
       console.log("2) Download file");
       console.log("3) Smart sync folder (parallel + resume)");
-      console.log("4) Upload file dari link (URL)");
+      console.log("4) Upload file from URL");
       console.log("5) Exit");
 
-      const selected = this.ask("Pilih menu");
+      const selected = this.ask("Select menu option");
       if (selected === "1") {
-        const localPath = this.ask("Path file lokal");
-        const remotePath = this.ask("Path remote tujuan");
+        const localPath = this.ask("Local file path");
+        const remotePath = this.ask("Destination remote path");
         await this.client.upload(localPath, remotePath);
-        console.log("✅ Upload selesai.\n");
+        console.log("✅ Upload completed.\n");
       } else if (selected === "2") {
-        const remotePath = this.ask("Path file remote");
-        const localPath = this.ask("Path file lokal output");
+        const remotePath = this.ask("Remote file path");
+        const localPath = this.ask("Local output file path");
         await this.client.download(remotePath, localPath);
-        console.log("✅ Download selesai.\n");
+        console.log("✅ Download completed.\n");
       } else if (selected === "3") {
-        const localFolder = this.ask("Folder lokal sumber");
-        const remoteFolder = this.ask("Folder remote tujuan");
+        const localFolder = this.ask("Source local folder");
+        const remoteFolder = this.ask("Destination remote folder");
         const concurrency = parseInt(this.ask("Concurrency (default 4)") || "4", 10);
 
         const report = await smartSync(this.client, localFolder, remoteFolder, Number.isNaN(concurrency) ? 4 : concurrency);
-        console.log("\n🏁 Smart sync selesai!");
+        console.log("\n🏁 Smart sync completed!");
         console.log(`Processed: ${report.processed}`);
         console.log(`Uploaded : ${report.uploaded}`);
         console.log(`Skipped  : ${report.skipped}`);
         console.log(`Failed   : ${report.failed}`);
-        console.log(`Durasi   : ${(report.elapsedMs / 1000).toFixed(2)} detik\n`);
+        console.log(`Duration : ${(report.elapsedMs / 1000).toFixed(2)} seconds\n`);
       } else if (selected === "4") {
-        const fileUrl = this.ask("Link file (URL)");
-        const remotePath = this.ask("Path remote tujuan (boleh folder dengan akhiran /)");
+        const fileUrl = this.ask("File URL");
+        const remotePath = this.ask("Destination remote path (folder is allowed with trailing /)");
 
         const slashIndex = remotePath.lastIndexOf("/");
         const remoteDir = remotePath.endsWith("/")
@@ -501,12 +558,12 @@ export class DrivePowerPanel {
         if (remoteDir) await this.client.mkdir(remoteDir);
 
         const uploadedPath = await this.client.uploadFromLink(fileUrl, remotePath);
-        console.log(`✅ Upload dari link selesai: ${uploadedPath}\n`);
+        console.log(`✅ URL upload completed: ${uploadedPath}\n`);
       } else if (selected === "5") {
-        console.log("👋 Sampai jumpa.");
+        console.log("👋 See you next time.");
         return;
       } else {
-        console.log("⚠️ Menu tidak dikenal.\n");
+        console.log("⚠️ Unknown menu option.\n");
       }
     }
   }
@@ -519,7 +576,7 @@ if (import.meta.main) {
 
   const config = await loadRcloneConfig(configPath, remoteName);
   if (!config) {
-    console.error(`❌ Remote [${remoteName}] tidak ditemukan dari ${configPath}`);
+    console.error(`❌ Remote [${remoteName}] was not found in ${configPath}`);
     Deno.exit(1);
   }
 

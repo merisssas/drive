@@ -16,9 +16,9 @@ if (import.meta.main) {
 
   const client = new WebDavClient(config);
 
-  console.log("WebDAV client aktif (mode harmonized). Gunakan drive_panel.ts untuk panel lengkap.");
-  console.log("Contoh upload: await client.upload('./contoh_file.zip', '/folder_tujuan/')");
-  console.log("Contoh download: await client.download('/folder_remote/file.mp4', './file_hasil.mp4')");
+  console.log("WebDAV client is active (harmonized mode). Use drive_panel.ts for the full panel experience.");
+  console.log("Example upload: await client.upload('./sample_file.zip', '/destination_folder/')");
+  console.log("Example download: await client.download('/remote_folder/file.mp4', './downloaded_file.mp4')");
 
   void client;
 }
