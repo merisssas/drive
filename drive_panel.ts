@@ -44,6 +44,8 @@ interface RemoteMetadata {
   lastModified: string | null;
 }
 
+type SyncCompareMode = "size" | "size+etag";
+
 async function rcloneReveal(obscured: string): Promise<string> {
   if (!obscured) return "";
 
@@ -106,15 +108,40 @@ export class HarmonyWebDavClient {
   private readonly createdDirs = new Set<string>();
   private readonly pendingDirs = new Map<string, Promise<void>>();
   private readonly uploadTimeoutMs: number;
+  private readonly maxRetries: number;
+  private readonly retryDelayMs: number;
 
   constructor(config: RemoteConfig) {
     this.baseUrl = config.url.replace(/\/$/, "");
     this.authHeader = `Basic ${encodeBase64(`${config.user}:${config.pass}`)}`;
     this.uploadTimeoutMs = Number(Deno.env.get("UPLOAD_TIMEOUT_MS") ?? "30000");
+    this.maxRetries = Number(Deno.env.get("MAX_RETRIES") ?? "2");
+    this.retryDelayMs = Number(Deno.env.get("RETRY_DELAY_MS") ?? "600");
   }
 
   private cleanPath(path: string): string {
     return path.replace(/^\//, "").split("/").map(encodeURIComponent).join("/");
+  }
+
+  private isRetryableStatus(status: number): boolean {
+    return status === 408 || status === 425 || status === 429 || status >= 500;
+  }
+
+  private async withRetry<T>(operation: (attempt: number) => Promise<T>): Promise<T> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      try {
+        return await operation(attempt);
+      } catch (error) {
+        lastError = error;
+        if (attempt === this.maxRetries) break;
+
+        const backoff = this.retryDelayMs * (attempt + 1);
+        await new Promise((resolve) => setTimeout(resolve, backoff));
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error("Operasi gagal setelah retry");
   }
 
   async mkdir(remotePath: string): Promise<void> {
@@ -143,13 +170,19 @@ export class HarmonyWebDavClient {
 
   async getRemoteMetadata(remotePath: string): Promise<RemoteMetadata | null> {
     const targetUrl = `${this.baseUrl}/${this.cleanPath(remotePath)}`;
-    try {
+    return await this.withRetry(async () => {
       const response = await fetch(targetUrl, {
         method: "HEAD",
         headers: { Authorization: this.authHeader },
       });
 
-      if (!response.ok) return null;
+      if (response.status === 404) return null;
+      if (!response.ok) {
+        if (this.isRetryableStatus(response.status)) {
+          throw new Error(`HEAD gagal: ${response.status} ${response.statusText}`);
+        }
+        return null;
+      }
 
       const length = response.headers.get("Content-Length");
       return {
@@ -157,9 +190,7 @@ export class HarmonyWebDavClient {
         etag: normalizeEtag(response.headers.get("ETag")),
         lastModified: response.headers.get("Last-Modified"),
       };
-    } catch {
-      return null;
-    }
+    });
   }
 
   async upload(localPath: string, remotePath: string): Promise<void> {
@@ -168,26 +199,32 @@ export class HarmonyWebDavClient {
       : remotePath;
 
     const targetUrl = `${this.baseUrl}/${this.cleanPath(normalizedRemote)}`;
-    const file = await Deno.open(localPath, { read: true });
+    const stat = await Deno.stat(localPath);
 
-    try {
-      const stat = await file.stat();
-      const response = await fetch(targetUrl, {
-        method: "PUT",
-        headers: {
-          Authorization: this.authHeader,
-          "Content-Length": stat.size.toString(),
-          "Content-Type": "application/octet-stream",
-        },
-        body: file.readable,
-      });
+    await this.withRetry(async () => {
+      const file = await Deno.open(localPath, { read: true });
+      try {
+        const response = await fetch(targetUrl, {
+          method: "PUT",
+          headers: {
+            Authorization: this.authHeader,
+            "Content-Length": stat.size.toString(),
+            "Content-Type": "application/octet-stream",
+          },
+          body: file.readable,
+          signal: AbortSignal.timeout(this.uploadTimeoutMs),
+        });
 
-      if (!response.ok && response.status !== 201 && response.status !== 204) {
-        throw new Error(`Upload gagal: ${response.status} ${response.statusText}`);
+        if (!response.ok && response.status !== 201 && response.status !== 204) {
+          if (this.isRetryableStatus(response.status)) {
+            throw new Error(`Upload retryable: ${response.status} ${response.statusText}`);
+          }
+          throw new Error(`Upload gagal: ${response.status} ${response.statusText}`);
+        }
+      } finally {
+        file.close();
       }
-    } finally {
-      file.close();
-    }
+    });
   }
 
   private pickFilenameFromLink(fileUrl: string, contentDisposition: string | null): string {
@@ -217,54 +254,68 @@ export class HarmonyWebDavClient {
   }
 
   async uploadFromLink(fileUrl: string, remotePath: string): Promise<string> {
-    const sourceResponse = await fetch(fileUrl, { signal: AbortSignal.timeout(this.uploadTimeoutMs) });
-    if (!sourceResponse.ok || !sourceResponse.body) {
-      throw new Error(`Gagal mengambil file dari link: ${sourceResponse.status} ${sourceResponse.statusText}`);
-    }
+    return await this.withRetry(async () => {
+      const sourceResponse = await fetch(fileUrl, { signal: AbortSignal.timeout(this.uploadTimeoutMs) });
+      if (!sourceResponse.ok || !sourceResponse.body) {
+        if (this.isRetryableStatus(sourceResponse.status)) {
+          throw new Error(`Ambil link retryable: ${sourceResponse.status} ${sourceResponse.statusText}`);
+        }
+        throw new Error(`Gagal mengambil file dari link: ${sourceResponse.status} ${sourceResponse.statusText}`);
+      }
 
-    const fileName = this.pickFilenameFromLink(fileUrl, sourceResponse.headers.get("Content-Disposition"));
-    const normalizedRemote = remotePath.endsWith("/")
-      ? normalizeRemotePath(remotePath, fileName)
-      : remotePath;
+      const fileName = this.pickFilenameFromLink(fileUrl, sourceResponse.headers.get("Content-Disposition"));
+      const normalizedRemote = remotePath.endsWith("/")
+        ? normalizeRemotePath(remotePath, fileName)
+        : remotePath;
 
-    const targetUrl = `${this.baseUrl}/${this.cleanPath(normalizedRemote)}`;
-    const contentType = sourceResponse.headers.get("Content-Type") ?? "application/octet-stream";
-    const contentLength = sourceResponse.headers.get("Content-Length");
-    const response = await fetch(targetUrl, {
-      method: "PUT",
-      headers: {
-        Authorization: this.authHeader,
-        "Content-Type": contentType,
-        ...(contentLength ? { "Content-Length": contentLength } : {}),
-      },
-      body: sourceResponse.body,
-      signal: AbortSignal.timeout(this.uploadTimeoutMs),
+      const targetUrl = `${this.baseUrl}/${this.cleanPath(normalizedRemote)}`;
+      const contentType = sourceResponse.headers.get("Content-Type") ?? "application/octet-stream";
+      const contentLength = sourceResponse.headers.get("Content-Length");
+      const response = await fetch(targetUrl, {
+        method: "PUT",
+        headers: {
+          Authorization: this.authHeader,
+          "Content-Type": contentType,
+          ...(contentLength ? { "Content-Length": contentLength } : {}),
+        },
+        body: sourceResponse.body,
+        signal: AbortSignal.timeout(this.uploadTimeoutMs),
+      });
+
+      if (!response.ok && response.status !== 201 && response.status !== 204) {
+        if (this.isRetryableStatus(response.status)) {
+          throw new Error(`Upload link retryable: ${response.status} ${response.statusText}`);
+        }
+        throw new Error(`Upload dari link gagal: ${response.status} ${response.statusText}`);
+      }
+
+      return normalizedRemote;
     });
-
-    if (!response.ok && response.status !== 201 && response.status !== 204) {
-      throw new Error(`Upload dari link gagal: ${response.status} ${response.statusText}`);
-    }
-
-    return normalizedRemote;
   }
 
   async download(remotePath: string, localPath: string): Promise<void> {
     const targetUrl = `${this.baseUrl}/${this.cleanPath(remotePath)}`;
-    const response = await fetch(targetUrl, {
-      method: "GET",
-      headers: { Authorization: this.authHeader },
+    await this.withRetry(async () => {
+      const response = await fetch(targetUrl, {
+        method: "GET",
+        headers: { Authorization: this.authHeader },
+        signal: AbortSignal.timeout(this.uploadTimeoutMs),
+      });
+
+      if (!response.ok || !response.body) {
+        if (this.isRetryableStatus(response.status)) {
+          throw new Error(`Download retryable: ${response.status} ${response.statusText}`);
+        }
+        throw new Error(`Download gagal: ${response.status} ${response.statusText}`);
+      }
+
+      const file = await Deno.open(localPath, { write: true, create: true, truncate: true });
+      try {
+        await response.body.pipeTo(file.writable);
+      } finally {
+        file.close();
+      }
     });
-
-    if (!response.ok || !response.body) {
-      throw new Error(`Download gagal: ${response.status} ${response.statusText}`);
-    }
-
-    const file = await Deno.open(localPath, { write: true, create: true, truncate: true });
-    try {
-      await response.body.pipeTo(file.writable);
-    } finally {
-      file.close();
-    }
   }
 }
 
@@ -287,6 +338,7 @@ export async function smartSync(
   localFolder: string,
   remoteFolder: string,
   concurrency = 4,
+  compareMode: SyncCompareMode = (Deno.env.get("SYNC_COMPARE_MODE") as SyncCompareMode) ?? "size+etag",
 ): Promise<SyncReport> {
   const files: SyncTask[] = [];
 
@@ -321,11 +373,18 @@ export async function smartSync(
 
         const etagAvailable = remoteMetadata?.etag;
         const sameSize = remoteMetadata?.size !== null && remoteMetadata?.size === task.size;
-        const sameChecksum = etagAvailable
+        const canCompareChecksum = compareMode === "size+etag" && !!etagAvailable;
+        const sameChecksum = canCompareChecksum
           ? (await md5FromPath(task.local)).toLowerCase() === etagAvailable.toLowerCase()
           : false;
 
-        if (sameSize && sameChecksum) {
+        const isSynced = compareMode === "size"
+          ? sameSize
+          : canCompareChecksum
+          ? sameSize && sameChecksum
+          : false;
+
+        if (isSynced) {
           skipped++;
           console.log(`[SKIP] ${basename(task.local)} (already synchronized)`);
         } else {
@@ -369,6 +428,10 @@ export class DrivePowerPanel {
     return Deno.prompt(question)?.trim() ?? "";
   }
 
+  private askMasked(question: string): string {
+    return Deno.prompt(question, { mask: "*" })?.trim() ?? "";
+  }
+
   private renderHero(): void {
     console.log("\n⚡ Harmony Drive Panel ⚡");
     console.log("Satu script terpadu: login, upload, download, smart sync, dan telemetry.");
@@ -378,7 +441,7 @@ export class DrivePowerPanel {
   async login(): Promise<boolean> {
     this.renderHero();
     const username = this.ask("Username");
-    const password = this.ask("Password");
+    const password = this.askMasked("Password");
 
     if (username !== this.loginConfig.username || password !== this.loginConfig.password) {
       console.error("❌ Login gagal. Cek PANEL_USER/PANEL_PASS atau kredensial default.");
