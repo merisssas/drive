@@ -8,6 +8,16 @@ type DriveItem = {
   modifiedAt: string;
   owner: string;
   shared?: boolean;
+  deleted?: boolean;
+  modifiedRank: number;
+};
+
+type DriveView = "my-files" | "recent" | "shared" | "trash";
+
+type NavMeta = {
+  label: string;
+  description: string;
+  count: number;
 };
 
 const DRIVE_ITEMS: DriveItem[] = [
@@ -18,6 +28,7 @@ const DRIVE_ITEMS: DriveItem[] = [
     modifiedAt: "Hari ini, 09:42",
     owner: "Saya",
     shared: true,
+    modifiedRank: 1,
   },
   {
     id: "f-assets",
@@ -25,6 +36,7 @@ const DRIVE_ITEMS: DriveItem[] = [
     type: "folder",
     modifiedAt: "Kemarin, 21:13",
     owner: "Tim Brand",
+    modifiedRank: 2,
   },
   {
     id: "f-contract",
@@ -33,6 +45,7 @@ const DRIVE_ITEMS: DriveItem[] = [
     modifiedAt: "07 Feb 2026",
     owner: "Legal",
     shared: true,
+    modifiedRank: 7,
   },
   {
     id: "doc-roadmap",
@@ -41,6 +54,7 @@ const DRIVE_ITEMS: DriveItem[] = [
     size: "2.1 MB",
     modifiedAt: "Hari ini, 08:55",
     owner: "Saya",
+    modifiedRank: 3,
   },
   {
     id: "doc-budget",
@@ -50,6 +64,7 @@ const DRIVE_ITEMS: DriveItem[] = [
     modifiedAt: "Kemarin, 17:04",
     owner: "Finance",
     shared: true,
+    modifiedRank: 4,
   },
   {
     id: "img-landing",
@@ -58,6 +73,7 @@ const DRIVE_ITEMS: DriveItem[] = [
     size: "4.6 MB",
     modifiedAt: "31 Jan 2026",
     owner: "Tim Design",
+    modifiedRank: 8,
   },
   {
     id: "vid-demo",
@@ -67,6 +83,7 @@ const DRIVE_ITEMS: DriveItem[] = [
     modifiedAt: "29 Jan 2026",
     owner: "Saya",
     shared: true,
+    modifiedRank: 5,
   },
   {
     id: "zip-backup",
@@ -75,8 +92,34 @@ const DRIVE_ITEMS: DriveItem[] = [
     size: "1.3 GB",
     modifiedAt: "25 Jan 2026",
     owner: "Infra",
+    deleted: true,
+    modifiedRank: 6,
   },
 ];
+
+const VIEW_META: Record<DriveView, NavMeta> = {
+  "my-files": {
+    label: "File Saya",
+    description: "Semua file milik Anda dan tim.",
+    count: DRIVE_ITEMS.filter((item) => !item.deleted).length,
+  },
+  recent: {
+    label: "Recent",
+    description: "Aktivitas paling baru yang mudah diakses kembali.",
+    count: DRIVE_ITEMS.filter((item) => !item.deleted && item.modifiedRank <= 6)
+      .length,
+  },
+  shared: {
+    label: "Shared",
+    description: "File/folder yang dibagikan ke Anda atau tim lain.",
+    count: DRIVE_ITEMS.filter((item) => !item.deleted && item.shared).length,
+  },
+  trash: {
+    label: "Trash",
+    description: "Item terhapus yang masih bisa direstore.",
+    count: DRIVE_ITEMS.filter((item) => item.deleted).length,
+  },
+};
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body, null, 2), {
@@ -107,12 +150,49 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
+function getView(rawView: string | null): DriveView {
+  if (rawView === "recent" || rawView === "shared" || rawView === "trash") {
+    return rawView;
+  }
+
+  return "my-files";
+}
+
+function filterItems(view: DriveView, keyword: string): DriveItem[] {
+  const loweredKeyword = keyword.toLowerCase();
+  return DRIVE_ITEMS.filter((item) => {
+    const matchesView = view === "my-files"
+      ? !item.deleted
+      : view === "recent"
+      ? !item.deleted && item.modifiedRank <= 6
+      : view === "shared"
+      ? !item.deleted && item.shared
+      : item.deleted;
+
+    if (!matchesView) {
+      return false;
+    }
+
+    if (!loweredKeyword) {
+      return true;
+    }
+
+    return [item.name, item.owner, item.modifiedAt]
+      .join(" ")
+      .toLowerCase()
+      .includes(loweredKeyword);
+  });
+}
+
 function renderDriveRows(items: DriveItem[]): string {
   return items
     .map((item) => {
       const icon = item.type === "folder" ? "📁" : "📄";
       const sharedBadge = item.shared
         ? '<span class="shared">Shared</span>'
+        : "";
+      const trashBadge = item.deleted
+        ? '<span class="trash-badge">Di Trash</span>'
         : "";
       const size = item.type === "folder" ? "—" : escapeHtml(item.size ?? "—");
 
@@ -122,6 +202,7 @@ function renderDriveRows(items: DriveItem[]): string {
             <span class="item-icon">${icon}</span>
             <span>${escapeHtml(item.name)}</span>
             ${sharedBadge}
+            ${trashBadge}
           </div>
         </td>
         <td>${escapeHtml(item.owner)}</td>
@@ -132,7 +213,28 @@ function renderDriveRows(items: DriveItem[]): string {
     .join("\n");
 }
 
-function renderHomePage(): string {
+function renderNav(currentView: DriveView, currentSearch: string): string {
+  const params = new URLSearchParams();
+  if (currentSearch) {
+    params.set("q", currentSearch);
+  }
+
+  return Object.entries(VIEW_META).map(([viewKey, meta]) => {
+    const view = viewKey as DriveView;
+    const itemParams = new URLSearchParams(params);
+    itemParams.set("view", view);
+
+    return `<a class="nav-item ${
+      currentView === view ? "active" : ""
+    }" href="/?${itemParams.toString()}">${meta.label} <span>${meta.count}</span></a>`;
+  }).join("\n");
+}
+
+function renderHomePage(view: DriveView, searchTerm: string): string {
+  const selectedMeta = VIEW_META[view];
+  const filteredItems = filterItems(view, searchTerm);
+  const safeSearchTerm = escapeHtml(searchTerm);
+
   return `<!doctype html>
 <html lang="id">
   <head>
@@ -231,14 +333,29 @@ function renderHomePage(): string {
         margin-bottom: 1rem;
       }
 
+      .search-form {
+        flex: 1;
+        max-width: 600px;
+        display: flex;
+        gap: 0.65rem;
+      }
+
       .search {
         flex: 1;
-        max-width: 460px;
         border: 1px solid var(--line);
         border-radius: 0.75rem;
         padding: 0.68rem 0.8rem;
         background: rgba(15, 23, 42, 0.7);
         color: var(--text);
+      }
+
+      .search-button {
+        border: 1px solid rgba(99, 102, 241, 0.5);
+        border-radius: 0.75rem;
+        background: rgba(79, 70, 229, 0.25);
+        color: var(--text);
+        padding: 0.65rem 0.95rem;
+        font-weight: 600;
       }
 
       .status {
@@ -319,6 +436,21 @@ function renderHomePage(): string {
         border-radius: 999px;
       }
 
+      .trash-badge {
+        margin-left: 0.45rem;
+        font-size: 0.74rem;
+        background: rgba(248, 113, 113, 0.18);
+        border: 1px solid rgba(248, 113, 113, 0.4);
+        color: #fecaca;
+        padding: 0.18rem 0.45rem;
+        border-radius: 999px;
+      }
+
+      .empty-state {
+        padding: 2rem 1.1rem;
+        color: var(--muted);
+      }
+
       .footer {
         margin-top: 1rem;
         color: var(--muted);
@@ -339,6 +471,15 @@ function renderHomePage(): string {
           border-bottom: 1px solid var(--line);
         }
 
+        .topbar {
+          flex-direction: column;
+          align-items: stretch;
+        }
+
+        .search-form {
+          max-width: none;
+        }
+
         th:nth-child(2),
         th:nth-child(3),
         td:nth-child(2),
@@ -353,41 +494,48 @@ function renderHomePage(): string {
       <aside>
         <h1 class="brand">${APP_NAME}</h1>
         <p class="subtitle">Web dashboard untuk sinkronisasi WebDAV</p>
-        <button class="new-button" type="button">+ Baru</button>
+        <button class="new-button" type="button" title="Demo UI">+ Baru</button>
 
         <nav>
-          <a class="nav-item active" href="/">File Saya <span>12</span></a>
-          <a class="nav-item" href="#">Recent <span>6</span></a>
-          <a class="nav-item" href="#">Shared <span>4</span></a>
-          <a class="nav-item" href="#">Trash <span>0</span></a>
+          ${renderNav(view, searchTerm)}
         </nav>
       </aside>
 
       <main>
         <div class="topbar">
-          <input class="search" placeholder="Cari file dan folder..." aria-label="Cari file" />
+          <form class="search-form" method="get" action="/">
+            <input type="hidden" name="view" value="${view}" />
+            <input class="search" name="q" value="${safeSearchTerm}" placeholder="Cari file dan folder..." aria-label="Cari file" />
+            <button class="search-button" type="submit">Cari</button>
+          </form>
           <span class="status">Server aktif</span>
         </div>
 
         <section class="panel">
           <div class="panel-head">
-            <h2>Semua file</h2>
-            <small>Tampilan ala Google Drive / Nextcloud</small>
+            <h2>${selectedMeta.label}</h2>
+            <small>${selectedMeta.description}</small>
           </div>
 
-          <table>
-            <thead>
-              <tr>
-                <th>Nama</th>
-                <th>Pemilik</th>
-                <th>Ukuran</th>
-                <th>Diubah</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${renderDriveRows(DRIVE_ITEMS)}
-            </tbody>
-          </table>
+          ${
+    filteredItems.length === 0
+      ? `<p class="empty-state">Tidak ada item untuk filter saat ini${
+        safeSearchTerm ? ` dengan kata kunci \"${safeSearchTerm}\"` : ""
+      }.</p>`
+      : `<table>
+                <thead>
+                  <tr>
+                    <th>Nama</th>
+                    <th>Pemilik</th>
+                    <th>Ukuran</th>
+                    <th>Diubah</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${renderDriveRows(filteredItems)}
+                </tbody>
+              </table>`
+  }
         </section>
 
         <p class="footer">Health check tetap tersedia di <a href="/health">/health</a>.</p>
@@ -398,14 +546,18 @@ function renderHomePage(): string {
 }
 
 Deno.serve((request) => {
-  const { pathname } = new URL(request.url);
+  const url = new URL(request.url);
+  const { pathname, searchParams } = url;
 
   if (pathname === "/health") {
     return json({ status: "ok", service: APP_NAME });
   }
 
   if (pathname === "/") {
-    return html(renderHomePage());
+    const view = getView(searchParams.get("view"));
+    const searchTerm = searchParams.get("q")?.trim() ?? "";
+
+    return html(renderHomePage(view, searchTerm));
   }
 
   return json({ error: "Not found" }, 404);
