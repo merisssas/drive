@@ -1,0 +1,8 @@
+{
+  "tasks": {
+    "start": "deno run --allow-net main.ts",
+    "panel": "deno run --allow-env --allow-net --allow-read --allow-write drive_panel.ts",
+    "sync": "deno run --allow-env --allow-net --allow-read smart_sync.ts",
+    "turbo": "deno run --allow-env --allow-net --allow-read turbo_client.ts"
+  }
+}
